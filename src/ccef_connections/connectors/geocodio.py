@@ -104,13 +104,34 @@ class GeocodioConnector(BaseConnection):
         """
         Build base query parameters (api_key + optional fields).
 
+        Connects first if necessary. This ordering is load-bearing: every public
+        method builds its params *before* calling ``_request`` (which is where
+        ``_ensure_connected`` used to be reached first), so on a fresh connector
+        that had never been explicitly ``connect()``-ed, ``self._api_key`` was
+        still ``None`` when it was read here. ``requests`` silently *drops*
+        query parameters whose value is ``None``, so the request went out with
+        no ``api_key`` at all and Geocodio answered ``403 {"error": "Invalid API
+        key"}`` — pointing every investigation at the credential instead of the
+        call order. Callers that happened to call ``connect()`` or
+        ``health_check()`` first were unaffected, which is why this survived.
+
         Args:
             fields: Optional list of Geocodio field appends (e.g. ``["cd", "stateleg"]``)
 
         Returns:
             Dict of query parameters
+
+        Raises:
+            ConnectionError: If no API key is available after connecting.
         """
-        params: Dict[str, str] = {"api_key": self._api_key}  # type: ignore[assignment]
+        self._ensure_connected()
+        if not self._api_key:
+            raise ConnectionError(
+                "Geocodio API key is unavailable after connect(); refusing to send an "
+                "unauthenticated request (it would return a misleading 403 "
+                '"Invalid API key")'
+            )
+        params: Dict[str, str] = {"api_key": self._api_key}
         if fields:
             params["fields"] = ",".join(fields)
         return params

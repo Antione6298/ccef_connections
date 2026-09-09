@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ccef-connections"
-version = "0.13.0"
+version = "0.13.1"
 description = "Reusable connection library for CCEF data integrations"
 authors = [{name = "Common Cause Education Fund"}]
 license = {text = "MIT"}
