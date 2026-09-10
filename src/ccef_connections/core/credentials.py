@@ -388,6 +388,46 @@ class CredentialManager:
         """
         return str(self.get_credential(credential_name))
 
+    def get_chariot_key(self, credential_name: str = "CHARIOT_API_KEY") -> str:
+        """
+        Get the Chariot REST API key.
+
+        ⚠ **Single-field JSON, not a bare string**: ``{"key": "sk_live_..."}``. There
+        is no ``api_name`` because Chariot is one account per credential, unlike
+        Stripe's several. A bare string is accepted too, for tolerance.
+
+        Args:
+            credential_name: Name of the credential (default: "CHARIOT_API_KEY").
+                The env var read is {credential_name}_PASSWORD.
+
+        Returns:
+            The API key as a string
+
+        Raises:
+            CredentialError: If the credential is missing or carries no key
+        """
+        raw = self.get_credential(credential_name)
+        if isinstance(raw, str):
+            text = raw.strip()
+            if text.startswith("{"):
+                import json as _json
+
+                try:
+                    raw = _json.loads(text)
+                except ValueError:
+                    return text
+            else:
+                return text
+        if isinstance(raw, dict):
+            for field in ("key", "api_key", "token", "secret"):
+                if raw.get(field):
+                    return str(raw[field])
+            raise CredentialError(
+                f"{credential_name}_PASSWORD is JSON but carries no key field; "
+                f"expected one of key/api_key/token/secret, got {sorted(raw)}"
+            )
+        return str(raw)
+
     def get_civis_api_key(self, credential_name: str = "CIVIS_API_KEY") -> str:
         """
         Get a Civis Platform API key.

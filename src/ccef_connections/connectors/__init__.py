@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from .sheets import SheetsConnector
     from .sheets_writer import SheetsWriterConnector
     from .snowflake import SnowflakeConnector
+    from .chariot import ChariotConnector
     from .stripe import StripeConnector
     from .tatango import TatangoConnector
     from .user_profile import UserProfileConnector
@@ -52,6 +53,7 @@ _LAZY_IMPORTS = {
     "SheetsConnector": ("sheets", "sheets"),
     "SheetsWriterConnector": ("sheets_writer", "sheets"),
     "SnowflakeConnector": ("snowflake", "snowflake"),
+    "ChariotConnector": ("chariot", None),
     "StripeConnector": ("stripe", None),
     "TatangoConnector": ("tatango", None),
     "UserProfileConnector": ("user_profile", None),

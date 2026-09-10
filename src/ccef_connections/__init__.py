@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from .connectors.sheets import SheetsConnector
     from .connectors.sheets_writer import SheetsWriterConnector
     from .connectors.snowflake import SnowflakeConnector
+    from .connectors.chariot import ChariotConnector
     from .connectors.stripe import StripeConnector
     from .connectors.tatango import TatangoConnector
     from .connectors.user_profile import UserProfileConnector
@@ -72,6 +73,7 @@ _LAZY_IMPORTS = {
     "SheetsConnector": ("ccef_connections.connectors.sheets", "sheets"),
     "SheetsWriterConnector": ("ccef_connections.connectors.sheets_writer", "sheets"),
     "SnowflakeConnector": ("ccef_connections.connectors.snowflake", "snowflake"),
+    "ChariotConnector": ("ccef_connections.connectors.chariot", None),
     "StripeConnector": ("ccef_connections.connectors.stripe", None),
     "TatangoConnector": ("ccef_connections.connectors.tatango", None),
     "UserProfileConnector": ("ccef_connections.connectors.user_profile", None),
@@ -100,6 +102,7 @@ __all__ = [
     "SheetsConnector",
     "SheetsWriterConnector",
     "SnowflakeConnector",
+    "ChariotConnector",
     "StripeConnector",
     "TatangoConnector",
     "UserProfileConnector",

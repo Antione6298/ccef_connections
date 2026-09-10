@@ -862,6 +862,32 @@ def retry_civis_operation(func: Callable) -> Callable:
     )(func)
 
 
+def retry_chariot_operation(func: Callable) -> Callable:
+    """
+    Decorator for Chariot API operations with retry logic.
+
+    Only RateLimitError is retried, per the module rule — a 401 means the key is
+    wrong and a 404 means the path is wrong, and neither improves by waiting.
+
+    ⚠ Chariot publishes no rate limit and has never returned 429 in testing
+    (2026-09-08). This decorator exists so that if one ever appears it is handled
+    the same way as every other service, not because a limit is known.
+
+    Args:
+        func: The function to decorate
+
+    Returns:
+        Decorated function with Chariot-specific retry logic
+    """
+    return retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type(RateLimitError),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )(func)
+
+
 def retry_geocodio_operation(func: Callable) -> Callable:
     """
     Decorator for Geocodio API operations with retry logic.
