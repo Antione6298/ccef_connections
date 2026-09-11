@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from .connectors.openai import OpenAIConnector
     from .connectors.ptv import PTVConnector
     from .connectors.roi_crm import ROICRMConnector
+    from .connectors.sftp import SFTPConnector
     from .connectors.sheets import SheetsConnector
     from .connectors.sheets_writer import SheetsWriterConnector
     from .connectors.snowflake import SnowflakeConnector
@@ -70,6 +71,7 @@ _LAZY_IMPORTS = {
     "OpenAIConnector": ("ccef_connections.connectors.openai", "openai"),
     "PTVConnector": ("ccef_connections.connectors.ptv", None),
     "ROICRMConnector": ("ccef_connections.connectors.roi_crm", None),
+    "SFTPConnector": ("ccef_connections.connectors.sftp", "sftp"),
     "SheetsConnector": ("ccef_connections.connectors.sheets", "sheets"),
     "SheetsWriterConnector": ("ccef_connections.connectors.sheets_writer", "sheets"),
     "SnowflakeConnector": ("ccef_connections.connectors.snowflake", "snowflake"),
@@ -99,6 +101,7 @@ __all__ = [
     "OpenAIConnector",
     "PTVConnector",
     "ROICRMConnector",
+    "SFTPConnector",
     "SheetsConnector",
     "SheetsWriterConnector",
     "SnowflakeConnector",

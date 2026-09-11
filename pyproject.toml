@@ -43,11 +43,14 @@ openai = [
 snowflake = [
     "snowflake-connector-python>=3.0.0",
 ]
+sftp = [
+    "paramiko>=3.4.0",
+]
 pandas = [
     "pandas>=2.0.0",
 ]
 all = [
-    "ccef-connections[airtable,sheets,bigquery,openai,snowflake,pandas]",
+    "ccef-connections[airtable,sheets,bigquery,openai,snowflake,sftp,pandas]",
 ]
 dev = [
     "ccef-connections[all]",
