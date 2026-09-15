@@ -61,4 +61,4 @@ service-account*.json
 inbox/
 
 # Session handoffs are local working notes
-.claude/handoff.md
+HANDOFF.md
