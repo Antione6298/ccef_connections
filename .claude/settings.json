@@ -4,6 +4,7 @@
       "Bash(*)",
       "PowerShell(*)",
       "Edit(.claude/**)",
+      "Write(.claude/handoff.md)",
       "WebSearch",
       "WebFetch",
       "mcp__knowledge-library",
@@ -42,7 +43,7 @@
     "defaultMode": "acceptEdits"
   },
   "meta": {
-    "template_version": 17,
+    "template_version": 18,
     "scaffold_date": "2026-05-14",
     "project_type": "basic"
   }
