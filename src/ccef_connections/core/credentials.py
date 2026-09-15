@@ -427,6 +427,27 @@ class CredentialManager:
                 f"expected one of key/api_key/token/secret, got {sorted(raw)}"
             )
         return str(raw)
+    def get_render_api_key(self, credential_name: str = "RENDER_API_KEY") -> str:
+        """
+        Get a Render API key.
+
+        Render API keys are **workspace-wide and unscoped** — one key can read
+        and modify every service in the workspace, and Render offers no
+        per-service or read-only variant. There is no way to hand a script a
+        narrower key, so treat the key itself as the blast radius and keep it
+        out of anything that also runs untrusted input.
+
+        Args:
+            credential_name: Name of the credential (default: "RENDER_API_KEY").
+                The env var read is {credential_name}_PASSWORD.
+
+        Returns:
+            The API key as a string (Render's keys are prefixed ``rnd_``)
+
+        Raises:
+            CredentialError: If the credential is missing
+        """
+        return str(self.get_credential(credential_name))
 
     def get_civis_api_key(self, credential_name: str = "CIVIS_API_KEY") -> str:
         """

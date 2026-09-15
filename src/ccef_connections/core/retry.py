@@ -6,6 +6,7 @@ with intelligent backoff strategies tailored to different API rate limits.
 """
 
 import logging
+import random
 from typing import Any, Callable, Dict, Optional, Type, Tuple
 
 from tenacity import (
@@ -910,6 +911,54 @@ def retry_geocodio_operation(func: Callable) -> Callable:
     return retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=2.0, min=1.0, max=60.0),
+        retry=retry_if_exception_type(RateLimitError),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
+    )(func)
+
+
+def _wait_for_render_rate_limit(retry_state) -> float:
+    """Wait the duration the Render API requested, plus jitter.
+
+    Render's docs ask for exponential backoff *with random jitter* rather
+    than a fixed wait, because its per-minute windows are shared across
+    every caller using the same API key — a fleet of scripts retrying in
+    lockstep would re-collide on each attempt.
+    """
+    exc = retry_state.outcome.exception()
+    base = 5.0
+    if isinstance(exc, RateLimitError) and exc.retry_after:
+        base = float(exc.retry_after) + 2.0
+    return base + random.uniform(0, 2.0)
+
+
+def retry_render_operation(func: Callable) -> Callable:
+    """
+    Decorator for Render API operations with retry logic.
+
+    Render returns 429 with a ``Ratelimit-Reset`` header carrying a UTC
+    epoch timestamp (not a delta — the connector converts it). Limits are
+    generous for reads (400/min) and tight for writes (30/min, and 10/min
+    per service for deploys), so a deploy-triggering loop is the realistic
+    way to hit this.
+
+    Only retries on RateLimitError — 4xx/5xx surface immediately so the
+    caller sees the real error rather than waiting through five attempts.
+
+    Args:
+        func: The function to decorate
+
+    Returns:
+        Decorated function with Render-specific retry logic
+
+    Examples:
+        >>> @retry_render_operation
+        ... def list_custom_domains(service_id):
+        ...     return connector._request("GET", f"/services/{service_id}/custom-domains")
+    """
+    return retry(
+        stop=stop_after_attempt(5),
+        wait=_wait_for_render_rate_limit,
         retry=retry_if_exception_type(RateLimitError),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,

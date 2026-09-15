@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .hex import HexConnector
     from .openai import OpenAIConnector
     from .ptv import PTVConnector
+    from .render import RenderConnector
     from .roi_crm import ROICRMConnector
     from .sftp import SFTPConnector
     from .sheets import SheetsConnector
@@ -50,6 +51,7 @@ _LAZY_IMPORTS = {
     "HexConnector": ("hex", None),
     "OpenAIConnector": ("openai", "openai"),
     "PTVConnector": ("ptv", None),
+    "RenderConnector": ("render", None),
     "ROICRMConnector": ("roi_crm", None),
     "SFTPConnector": ("sftp", "sftp"),
     "SheetsConnector": ("sheets", "sheets"),

@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from .connectors.hex import HexConnector
     from .connectors.openai import OpenAIConnector
     from .connectors.ptv import PTVConnector
+    from .connectors.render import RenderConnector
     from .connectors.roi_crm import ROICRMConnector
     from .connectors.sftp import SFTPConnector
     from .connectors.sheets import SheetsConnector
@@ -52,7 +53,7 @@ if TYPE_CHECKING:
     from .connectors.zendesk import ZendeskConnector
     from .connectors.zoom import ZoomConnector
 
-__version__ = "0.13.1"
+__version__ = "0.14.0"
 
 # Lazy attribute -> (module, required extra or None).
 # Connectors with extra=None need only the base install (requests).
@@ -70,6 +71,7 @@ _LAZY_IMPORTS = {
     "HexConnector": ("ccef_connections.connectors.hex", None),
     "OpenAIConnector": ("ccef_connections.connectors.openai", "openai"),
     "PTVConnector": ("ccef_connections.connectors.ptv", None),
+    "RenderConnector": ("ccef_connections.connectors.render", None),
     "ROICRMConnector": ("ccef_connections.connectors.roi_crm", None),
     "SFTPConnector": ("ccef_connections.connectors.sftp", "sftp"),
     "SheetsConnector": ("ccef_connections.connectors.sheets", "sheets"),
@@ -100,6 +102,7 @@ __all__ = [
     "HexConnector",
     "OpenAIConnector",
     "PTVConnector",
+    "RenderConnector",
     "ROICRMConnector",
     "SFTPConnector",
     "SheetsConnector",
