@@ -460,3 +460,368 @@ class TestEnvVars:
         first = c._blueprint_managed_keys()
         blueprint.unlink()
         assert c._blueprint_managed_keys() == first
+
+
+# -- Workspace ---------------------------------------------------------------
+
+
+class TestOwner:
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_owner_id_is_discovered_and_cached(self, mock_request, connected):
+        mock_request.return_value = _make_response(
+            200, [{"owner": {"id": "tea-abc", "name": "Common Cause"}}]
+        )
+        assert connected.owner_id() == "tea-abc"
+        assert connected.owner_id() == "tea-abc"
+        assert mock_request.call_count == 1
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_pinned_owner_skips_the_lookup(self, mock_request, connector):
+        connector._api_key, connector._is_connected = FAKE_KEY, True
+        connector._owner_id = "tea-pinned"
+        assert connector.owner_id() == "tea-pinned"
+        mock_request.assert_not_called()
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_no_workspace_raises(self, mock_request, connected):
+        mock_request.return_value = _make_response(200, [])
+        with pytest.raises(ConnectionError, match="no workspace"):
+            connected.owner_id()
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_ambiguous_workspace_raises_rather_than_guessing(
+        self, mock_request, connected
+    ):
+        """Picking owners[0] would silently read another workspace's logs."""
+        mock_request.return_value = _make_response(
+            200,
+            [
+                {"owner": {"id": "tea-a", "name": "A"}},
+                {"owner": {"id": "usr-b", "name": "B"}},
+            ],
+        )
+        with pytest.raises(ConnectionError, match="2 workspaces"):
+            connected.owner_id()
+
+
+# -- Logs --------------------------------------------------------------------
+
+
+class TestLogs:
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_scopes_by_owner_and_resource(self, mock_request, connected):
+        connected._owner_id = "tea-abc"
+        mock_request.return_value = _make_response(200, {"logs": [], "hasMore": False})
+        connected.list_logs(SERVICE_ID)
+        params = mock_request.call_args[1]["params"]
+        assert params["ownerId"] == "tea-abc"
+        assert params["resource"] == SERVICE_ID
+        assert params["direction"] == "backward"
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_flattens_labels(self, mock_request, connected):
+        connected._owner_id = "tea-abc"
+        mock_request.return_value = _make_response(
+            200,
+            {
+                "logs": [
+                    {
+                        "message": "boom",
+                        "labels": [
+                            {"name": "type", "value": "request"},
+                            {"name": "statusCode", "value": "502"},
+                        ],
+                    }
+                ]
+            },
+        )
+        entry = connected.list_logs(SERVICE_ID)["logs"][0]
+        assert entry["labels_map"] == {"type": "request", "statusCode": "502"}
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_optional_filters_are_omitted_when_unset(self, mock_request, connected):
+        connected._owner_id = "tea-abc"
+        mock_request.return_value = _make_response(200, {"logs": []})
+        connected.list_logs(SERVICE_ID, log_type="request", status_code="502")
+        params = mock_request.call_args[1]["params"]
+        assert params["type"] == "request"
+        assert params["statusCode"] == "502"
+        assert "text" not in params
+        assert "level" not in params
+
+    @pytest.mark.parametrize("bad", [0, -1, 1001, 5000])
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_limit_outside_render_ceiling_raises_before_the_call(
+        self, mock_request, connected, bad
+    ):
+        """Render 400s above 1000; failing here says why instead."""
+        with pytest.raises(ValueError, match="1-1000"):
+            connected.list_logs(SERVICE_ID, limit=bad)
+        mock_request.assert_not_called()
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_bad_direction_raises(self, mock_request, connected):
+        with pytest.raises(ValueError, match="direction"):
+            connected.list_logs(SERVICE_ID, direction="sideways")
+        mock_request.assert_not_called()
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_label_values_returns_list(self, mock_request, connected):
+        connected._owner_id = "tea-abc"
+        mock_request.return_value = _make_response(200, ["200", "403", "502"])
+        assert connected.log_label_values(SERVICE_ID, "statusCode") == [
+            "200",
+            "403",
+            "502",
+        ]
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_label_values_empty_is_not_an_error(self, mock_request, connected):
+        connected._owner_id = "tea-abc"
+        mock_request.return_value = _make_response(200, None)
+        assert connected.log_label_values(SERVICE_ID, "path") == []
+
+
+# -- Events, instances, metrics ----------------------------------------------
+
+
+class TestEventsAndInstances:
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_events_unwrap(self, mock_request, connected):
+        mock_request.side_effect = [
+            _make_response(
+                200,
+                _page(
+                    [
+                        {
+                            "type": "server_failed",
+                            "details": {
+                                "reason": {"oomKilled": {"memoryLimit": "2Gi"}}
+                            },
+                        }
+                    ],
+                    "event",
+                ),
+            ),
+            _make_response(200, []),
+        ]
+        events = connected.list_events(SERVICE_ID)
+        assert events[0]["type"] == "server_failed"
+        assert events[0]["details"]["reason"]["oomKilled"]["memoryLimit"] == "2Gi"
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_instances_are_not_cursor_wrapped(self, mock_request, connected):
+        """This endpoint returns bare objects, unlike every other list here —
+        paginating it would yield nothing at all."""
+        mock_request.return_value = _make_response(
+            200, [{"id": "srv-x-abc", "status": "RUNNING", "ready": True}]
+        )
+        assert connected.list_instances(SERVICE_ID)[0]["status"] == "RUNNING"
+
+
+class TestMetrics:
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_unknown_metric_raises_before_the_call(self, mock_request, connected):
+        with pytest.raises(ValueError, match="not a Render metric"):
+            connected.metrics("disk-on-fire", SERVICE_ID)
+        mock_request.assert_not_called()
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_extras_reach_the_query(self, mock_request, connected):
+        mock_request.return_value = _make_response(200, [])
+        connected.metrics("http-latency", SERVICE_ID, quantile=0.95)
+        assert mock_request.call_args[1]["params"]["quantile"] == 0.95
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_peak_memory_reports_percent_of_ceiling(self, mock_request, connected):
+        mock_request.side_effect = [
+            _make_response(
+                200,
+                [{"unit": "bytes", "values": [{"value": 100}, {"value": 1500}]}],
+            ),
+            _make_response(200, [{"unit": "bytes", "values": [{"value": 2000}]}]),
+        ]
+        peak = connected.peak_memory(SERVICE_ID)
+        assert peak["peak_bytes"] == 1500
+        assert peak["limit_bytes"] == 2000
+        assert peak["pct_of_limit"] == 75.0
+        assert peak["samples"] == 2
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_peak_memory_without_a_ceiling_reports_none_not_zero(
+        self, mock_request, connected
+    ):
+        """A missing limit series must not read as '0% of limit'."""
+        mock_request.side_effect = [
+            _make_response(200, [{"values": [{"value": 100}]}]),
+            _make_response(200, []),
+        ]
+        peak = connected.peak_memory(SERVICE_ID)
+        assert peak["peak_bytes"] == 100
+        assert peak["limit_bytes"] is None
+        assert peak["pct_of_limit"] is None
+
+
+# -- Service lifecycle -------------------------------------------------------
+
+
+class TestLifecycle:
+    @pytest.mark.parametrize(
+        "method,path_tail",
+        [
+            ("restart_service", "restart"),
+            ("suspend_service", "suspend"),
+            ("resume_service", "resume"),
+        ],
+    )
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_lifecycle_posts_to_the_right_route(
+        self, mock_request, connected, method, path_tail
+    ):
+        mock_request.return_value = _make_response(204)
+        assert getattr(connected, method)(SERVICE_ID) is True
+        args = mock_request.call_args[0]
+        assert args[0] == "POST"
+        assert args[1] == f"{RENDER_API_BASE}/services/{SERVICE_ID}/{path_tail}"
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_scale_sends_instance_count(self, mock_request, connected):
+        mock_request.return_value = _make_response(204)
+        connected.scale_service(SERVICE_ID, 3)
+        assert mock_request.call_args[1]["json"] == {"numInstances": 3}
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_scale_to_zero_is_refused(self, mock_request, connected):
+        """Zero instances is a suspend wearing a costume — and Render would
+        reject it anyway, after the round trip."""
+        with pytest.raises(ValueError, match="suspend_service"):
+            connected.scale_service(SERVICE_ID, 0)
+        mock_request.assert_not_called()
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_update_service_with_no_fields_refuses(self, mock_request, connected):
+        with pytest.raises(WriteError, match="nothing to change"):
+            connected.update_service(SERVICE_ID)
+        mock_request.assert_not_called()
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_update_service_patches(self, mock_request, connected):
+        mock_request.return_value = _make_response(
+            200, {"id": SERVICE_ID, "serviceDetails": {"plan": "pro"}}
+        )
+        result = connected.update_service(SERVICE_ID, serviceDetails={"plan": "pro"})
+        assert mock_request.call_args[0][0] == "PATCH"
+        assert result["serviceDetails"]["plan"] == "pro"
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_cancel_deploy_route(self, mock_request, connected):
+        mock_request.return_value = _make_response(204)
+        assert connected.cancel_deploy(SERVICE_ID, "dep-1") is True
+        assert mock_request.call_args[0][1].endswith(
+            f"/services/{SERVICE_ID}/deploys/dep-1/cancel"
+        )
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_rollback_posts_to_the_service_not_the_deploy(
+        self, mock_request, connected
+    ):
+        """/services/{id}/deploys/{dep}/rollback does not exist - it 404s."""
+        mock_request.return_value = _make_response(200, {"id": "dep-new"})
+        connected.rollback_deploy(SERVICE_ID, "dep-old")
+        assert mock_request.call_args[0][1] == (
+            f"{RENDER_API_BASE}/services/{SERVICE_ID}/rollback"
+        )
+        assert mock_request.call_args[1]["json"] == {"deployId": "dep-old"}
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_rollback_to_an_unrollbackable_deploy_raises(
+        self, mock_request, connected
+    ):
+        mock_request.return_value = _make_response(404)
+        with pytest.raises(WriteError, match="cannot be rolled back"):
+            connected.rollback_deploy(SERVICE_ID, "dep-pruned")
+
+
+# -- Service creation --------------------------------------------------------
+
+
+class TestCreateService:
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_builds_the_render_body_shape(self, mock_request, connected):
+        connected._owner_id = "tea-abc"
+        mock_request.return_value = _make_response(
+            200, {"service": {"id": "srv-new", "name": "new-tool"}}
+        )
+        created = connected.create_service(
+            "new-tool",
+            "web_service",
+            "https://github.com/common-cause/new-tool",
+            build_command="pip install -r requirements.txt",
+            start_command="gunicorn app:app",
+            health_check_path="/health",
+            env_vars={"PYTHON_VERSION": "3.12"},
+        )
+        body = mock_request.call_args[1]["json"]
+        assert body["type"] == "web_service"
+        assert body["ownerId"] == "tea-abc"
+        assert body["autoDeploy"] == "yes"
+        assert body["serviceDetails"]["healthCheckPath"] == "/health"
+        assert body["serviceDetails"]["envSpecificDetails"] == {
+            "buildCommand": "pip install -r requirements.txt",
+            "startCommand": "gunicorn app:app",
+        }
+        assert body["envVars"] == [{"key": "PYTHON_VERSION", "value": "3.12"}]
+        # Render wraps the created object; callers want the service itself.
+        assert created["id"] == "srv-new"
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_rejection_becomes_a_write_error(self, mock_request, connected):
+        connected._owner_id = "tea-abc"
+        mock_request.return_value = _make_response(400, text="name already exists")
+        with pytest.raises(WriteError, match="rejected creating"):
+            connected.create_service(
+                "dupe", "web_service", "https://github.com/common-cause/x"
+            )
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_auto_deploy_off(self, mock_request, connected):
+        connected._owner_id = "tea-abc"
+        mock_request.return_value = _make_response(200, {"service": {"id": "srv-new"}})
+        connected.create_service(
+            "x",
+            "background_worker",
+            "https://github.com/common-cause/x",
+            auto_deploy=False,
+        )
+        assert mock_request.call_args[1]["json"]["autoDeploy"] == "no"
+
+
+# -- Other resources ---------------------------------------------------------
+
+
+class TestOtherResources:
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_postgres_unwraps(self, mock_request, connected):
+        mock_request.side_effect = [
+            _make_response(
+                200, _page([{"id": "dpg-1", "plan": "basic_256mb"}], "postgres")
+            ),
+            _make_response(200, []),
+        ]
+        assert connected.list_postgres()[0]["plan"] == "basic_256mb"
+
+    @patch("ccef_connections.connectors.render.requests.request")
+    def test_blueprints_unwrap(self, mock_request, connected):
+        mock_request.side_effect = [
+            _make_response(
+                200,
+                _page(
+                    [{"id": "exs-1", "autoSync": True, "status": "in_sync"}],
+                    "blueprint",
+                ),
+            ),
+            _make_response(200, []),
+        ]
+        bp = connected.list_blueprints()[0]
+        assert bp["autoSync"] is True
+        assert bp["status"] == "in_sync"

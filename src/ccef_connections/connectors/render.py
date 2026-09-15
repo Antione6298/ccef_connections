@@ -2,9 +2,19 @@
 Render connector for CCEF connections library.
 
 Render hosts our internal Flask tools (the first is ep-roving's director
-review UI). This is the transport layer for its REST API: services, deploys,
-build/deploy logs, custom domains, and environment variables — the things you
-would otherwise click through the dashboard for.
+review UI). This is the transport layer for its REST API: services and their
+lifecycle, deploys, app/request/build logs, the event timeline, metrics,
+custom domains, and environment variables — the things you would otherwise
+click through the dashboard for.
+
+Two design points worth understanding before using the write methods.
+
+**The event log is the only place a crash is recorded.** An OOM kill does not
+fail a deploy and does not mark a service unhealthy: Render restarts the
+instance, the health check passes, and the dashboard goes back to green. The
+deploy list, the service record and the log stream all look normal afterwards.
+``list_events`` is where ``server_failed`` / ``oomKilled`` lives, and
+``peak_memory`` is the number that says whether it is about to happen again.
 
 The design point worth understanding before using the write methods:
 
@@ -59,7 +69,51 @@ _ITEM_KEYS = {
     "deploys": "deploy",
     "custom-domains": "customDomain",
     "env-vars": "envVar",
+    "events": "event",
+    "postgres": "postgres",
+    "blueprints": "blueprint",
 }
+
+# Render keeps 30 days of logs and caps a single /logs query at 1000 entries
+# (1001+ is a 400, and a startTime older than 30 days is a 400 — both verified
+# against the live API 2026-09-15, neither documented as a number).
+LOG_MAX_LIMIT = 1000
+LOG_RETENTION_DAYS = 30
+
+# The log endpoints scan a time window rather than fetch a record, and are
+# markedly slower than the rest of the API — /logs/values in particular has been
+# measured past 30s on a service with a week of request logs. A read timeout
+# there surfaces as a bare ReadTimeout that reads like the API is down, so they
+# get their own, longer budget.
+DEFAULT_TIMEOUT = 30
+LOG_QUERY_TIMEOUT = 90
+
+# Metric series available from /metrics/{name}. The -limit pair is what makes
+# the others legible: memory alone is a number, memory against memory-limit is
+# how close the service is to being OOM-killed.
+METRIC_NAMES = (
+    "cpu",
+    "cpu-limit",
+    "memory",
+    "memory-limit",
+    "http-requests",
+    "http-latency",
+    "instance-count",
+    "bandwidth",
+    "active-connections",
+    "disk-usage",
+    "disk-capacity",
+)
+
+# Service states that mean "a deploy is mid-flight", for callers deciding
+# whether it is safe to start another.
+IN_FLIGHT_DEPLOY_STATUSES = frozenset({
+    "created",
+    "queued",
+    "build_in_progress",
+    "update_in_progress",
+    "pre_deploy_in_progress",
+})
 
 
 class RenderConnector(BaseConnection):
@@ -83,18 +137,26 @@ class RenderConnector(BaseConnection):
             with a literal ``value:``, because Render would revert it on the
             next Blueprint sync. Strongly recommended for Blueprint-managed
             services.
+        owner_id: Pin the workspace (``tea-...``). Only needed when the key
+            reaches more than one; otherwise it is discovered once and cached.
+        timeout: Read timeout in seconds for ordinary calls (default 30). Log
+            queries use ``LOG_QUERY_TIMEOUT`` regardless.
     """
 
     def __init__(
         self,
         credential_name: str = "RENDER_API_KEY",
         blueprint_path: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        timeout: int = DEFAULT_TIMEOUT,
     ) -> None:
         super().__init__()
         self._credential_name = credential_name
         self._blueprint_path = blueprint_path
         self._api_key: Optional[str] = None
         self._blueprint_keys: Optional[set] = None
+        self._owner_id: Optional[str] = owner_id
+        self._timeout = timeout
 
     # -- lifecycle -----------------------------------------------------
 
@@ -158,11 +220,22 @@ class RenderConnector(BaseConnection):
         path: str,
         params: Optional[Dict[str, Any]] = None,
         json_body: Optional[Any] = None,
+        timeout: Optional[int] = None,
     ) -> Optional[Any]:
         """
         Central HTTP method with auth headers and standard error mapping.
 
         Returns parsed JSON, or None for 204/404.
+
+        Args:
+            method: HTTP method.
+            path: API path beginning with "/".
+            params: Query parameters.
+            json_body: JSON request body.
+            timeout: Read timeout in seconds. Defaults to the connector's
+                ``timeout``; the log endpoints override it with
+                ``LOG_QUERY_TIMEOUT`` because they scan a time range rather
+                than read a record and can genuinely take most of a minute.
 
         Raises:
             AuthenticationError: For 401/403
@@ -180,7 +253,7 @@ class RenderConnector(BaseConnection):
                 headers=self._get_headers(),
                 params=params,
                 json=json_body,
-                timeout=30,
+                timeout=timeout or self._timeout,
             )
         except requests.RequestException as e:
             raise ConnectionError(f"Render API request failed: {e}") from e
@@ -657,6 +730,689 @@ class RenderConnector(BaseConnection):
         self._request("DELETE", f"/services/{service_id}/env-vars/{key}")
         logger.info(f"Deleted env var {key} from {service_id}")
         return True
+
+    # -- workspace -----------------------------------------------------
+
+    @retry_render_operation
+    def list_owners(self) -> List[Dict[str, Any]]:
+        """
+        List the workspaces (Render calls them "owners") this key can reach.
+
+        Returns:
+            A list of owner objects, each with ``id`` (``tea-...`` for a team,
+            ``usr-...`` for a personal account), ``name``, ``type`` and
+            ``email``.
+        """
+        entries = self._request("GET", "/owners") or []
+        return [e.get("owner", e) for e in entries if isinstance(e, dict)]
+
+    def owner_id(self) -> str:
+        """
+        The workspace id, cached for the life of the connector.
+
+        Needed by every log and metric query — those endpoints are scoped to a
+        workspace rather than to a service, so the service id alone is not
+        enough to ask for its own logs.
+
+        Returns:
+            The owner id.
+
+        Raises:
+            ConnectionError: If the key reaches no workspace, or more than one
+                and none was pinned via ``owner_id`` on the constructor.
+        """
+        if self._owner_id:
+            return self._owner_id
+
+        owners = self.list_owners()
+        if not owners:
+            raise ConnectionError(
+                "This Render key reaches no workspace. It may have been revoked."
+            )
+        if len(owners) > 1:
+            names = ", ".join(f"{o.get('name')} ({o.get('id')})" for o in owners)
+            raise ConnectionError(
+                f"This key reaches {len(owners)} workspaces ({names}); pass "
+                f"owner_id= to the constructor to say which one."
+            )
+        self._owner_id = owners[0]["id"]
+        return self._owner_id
+
+    # -- logs ----------------------------------------------------------
+
+    @retry_render_operation
+    def list_logs(
+        self,
+        resource: str,
+        log_type: Optional[str] = None,
+        level: Optional[str] = None,
+        text: Optional[str] = None,
+        limit: int = 100,
+        direction: str = "backward",
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        instance: Optional[str] = None,
+        status_code: Optional[str] = None,
+        method: Optional[str] = None,
+        path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Read a service's logs.
+
+        Three kinds of log share this one endpoint, distinguished by
+        ``log_type``, and confusing them wastes a debugging session:
+
+        * ``app`` — what the process wrote to stdout/stderr. Your own logging.
+        * ``request`` — Render's HTTP access log, one line per request, carrying
+          ``method``, ``path``, ``statusCode`` and response time. The process
+          never sees these, so a 403 rejected at the edge appears ONLY here.
+        * ``build`` — pip/npm output from a deploy's build phase.
+
+        Omitting ``log_type`` returns all three interleaved, which is usually
+        what you want when asking "what happened at 04:12".
+
+        ⚠ Retention is 30 days and a single query caps at 1000 entries; both
+        are enforced by Render with a 400, so they are validated here instead.
+
+        Args:
+            resource: The service id (``srv-...``) whose logs to read.
+            log_type: "app", "request" or "build". None for all.
+            level: Minimum-ish severity label, e.g. "error", "warning". Note
+                this is Render's own label, not your logger's: anything a
+                container writes to stderr can arrive tagged higher than you
+                meant it.
+            text: Substring filter, applied server-side.
+            limit: Max entries (Render's ceiling is 1000).
+            direction: "backward" for newest-first (the default, and what you
+                want for "what just happened"), "forward" for oldest-first.
+            start_time: ISO-8601 lower bound. Must be within 30 days.
+            end_time: ISO-8601 upper bound.
+            instance: Restrict to one instance id — the way to read a single
+                replica after a crash.
+            status_code: HTTP status filter, e.g. "502". Implies request logs.
+            method: HTTP method filter, e.g. "POST". Implies request logs.
+            path: Request path filter. Implies request logs.
+
+        Returns:
+            ``{"logs": [...], "hasMore": bool, "nextStartTime": ...,
+            "nextEndTime": ...}``. Each entry carries ``message``,
+            ``timestamp`` and a ``labels`` list; ``labels_map`` is added here
+            as a flat dict because the list form is tedious to read.
+
+        Raises:
+            ValueError: If limit or start_time is outside what Render accepts.
+        """
+        if limit < 1 or limit > LOG_MAX_LIMIT:
+            raise ValueError(
+                f"limit must be 1-{LOG_MAX_LIMIT}; Render 400s above that. For "
+                f"more than {LOG_MAX_LIMIT} entries, page with the returned "
+                f"nextStartTime/nextEndTime."
+            )
+        if direction not in ("backward", "forward"):
+            raise ValueError("direction must be 'backward' or 'forward'")
+
+        params: Dict[str, Any] = {
+            "ownerId": self.owner_id(),
+            "resource": resource,
+            "limit": limit,
+            "direction": direction,
+        }
+        for key, value in (
+            ("type", log_type),
+            ("level", level),
+            ("text", text),
+            ("startTime", start_time),
+            ("endTime", end_time),
+            ("instance", instance),
+            ("statusCode", status_code),
+            ("method", method),
+            ("path", path),
+        ):
+            if value:
+                params[key] = value
+
+        result = (
+            self._request("GET", "/logs", params=params, timeout=LOG_QUERY_TIMEOUT)
+            or {}
+        )
+        for entry in result.get("logs") or []:
+            entry["labels_map"] = {
+                label.get("name"): label.get("value")
+                for label in entry.get("labels") or []
+                if isinstance(label, dict)
+            }
+        return result
+
+    @retry_render_operation
+    def log_label_values(
+        self, resource: str, label: str, log_type: Optional[str] = None
+    ) -> List[str]:
+        """
+        List the values a log label actually takes for a service.
+
+        The cheap way to find out what there is to filter on before filtering:
+        which instances have run, which status codes have occurred, which hosts
+        answered. An empty list means the label does not apply to this service's
+        logs, not that the query failed — ``path`` is empty unless you also pass
+        ``log_type="request"``, because only request logs carry one.
+
+        Args:
+            resource: The service id.
+            label: One of "type", "level", "instance", "host", "statusCode",
+                "method", "path".
+            log_type: Restrict to one log type first.
+
+        Returns:
+            The list of observed values.
+        """
+        params: Dict[str, Any] = {
+            "ownerId": self.owner_id(),
+            "resource": resource,
+            "label": label,
+        }
+        if log_type:
+            params["type"] = log_type
+        return (
+            self._request(
+                "GET", "/logs/values", params=params, timeout=LOG_QUERY_TIMEOUT
+            )
+            or []
+        )
+
+    # -- events and instances ------------------------------------------
+
+    @retry_render_operation
+    def list_events(
+        self, service_id: str, limit: Optional[int] = 20
+    ) -> List[Dict[str, Any]]:
+        """
+        A service's event timeline, newest first.
+
+        The only place Render tells you why an instance died. Types seen in
+        practice: ``build_started`` / ``build_ended``, ``deploy_started`` /
+        ``deploy_ended``, ``server_available``, and ``server_failed`` — whose
+        ``details.reason`` carries ``oomKilled`` (with the memory ceiling it hit)
+        or ``evicted``.
+
+        That last one is the reason to read this at all. An OOM kill does not
+        fail a deploy and does not mark the service unhealthy: Render restarts
+        the instance, the health check passes, the dashboard stays green, and
+        nothing in the deploy list or the service record records that it
+        happened. Only the event log does.
+
+        Args:
+            service_id: The Render service ID.
+            limit: Maximum events to return. Default 20.
+
+        Returns:
+            A list of event objects, each with ``type``, ``timestamp`` and a
+            type-specific ``details`` mapping.
+        """
+        return list(
+            self._paginate(
+                f"/services/{service_id}/events", _ITEM_KEYS["events"], limit=limit
+            )
+        )
+
+    @retry_render_operation
+    def list_instances(self, service_id: str) -> List[Dict[str, Any]]:
+        """
+        The service's currently running instances.
+
+        Unlike most list endpoints here this one returns bare objects rather
+        than cursor-wrapped ones, so it is not paginated.
+
+        Args:
+            service_id: The Render service ID.
+
+        Returns:
+            A list of ``{"id", "createdAt", "status", "ready"}`` objects. The
+            ``createdAt`` is when the *instance* started, which is how you spot
+            a service that has been silently restarting: an age far younger than
+            its last deploy means something killed it.
+        """
+        return self._request("GET", f"/services/{service_id}/instances") or []
+
+    # -- metrics -------------------------------------------------------
+
+    @retry_render_operation
+    def metrics(
+        self,
+        name: str,
+        resource: str,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        resolution_seconds: Optional[int] = None,
+        **extra: Any,
+    ) -> List[Dict[str, Any]]:
+        """
+        Read one metric series for a resource.
+
+        Pair a usage metric with its ceiling — ``memory`` against
+        ``memory-limit``, ``cpu`` against ``cpu-limit`` — because the ceiling is
+        set by the service's plan and is the number that decides whether the fix
+        is a code change or a bigger plan.
+
+        Args:
+            name: A metric from ``METRIC_NAMES``. ``http-latency`` additionally
+                requires ``quantile`` (e.g. ``quantile=0.95``) as an extra.
+            resource: The service id (``srv-...``) or database id (``dpg-...``).
+            start_time: ISO-8601 lower bound. Defaults to Render's own window.
+            end_time: ISO-8601 upper bound.
+            resolution_seconds: Seconds per data point.
+            **extra: Any further query parameters the metric needs.
+
+        Returns:
+            A list of series, each ``{"labels": [...], "unit": ..., "values":
+            [{"timestamp", "value"}, ...]}``. An empty list means the metric
+            does not apply to this resource kind (``disk-usage`` on a service
+            with no disk, say) rather than an error.
+
+        Raises:
+            ValueError: If ``name`` is not a known metric.
+        """
+        if name not in METRIC_NAMES:
+            raise ValueError(
+                f"{name!r} is not a Render metric; known: {', '.join(METRIC_NAMES)}"
+            )
+        params: Dict[str, Any] = {"resource": resource}
+        if start_time:
+            params["startTime"] = start_time
+        if end_time:
+            params["endTime"] = end_time
+        if resolution_seconds:
+            params["resolutionSeconds"] = resolution_seconds
+        params.update(extra)
+        return self._request("GET", f"/metrics/{name}", params=params) or []
+
+    def peak_memory(self, service_id: str, **kwargs: Any) -> Dict[str, Any]:
+        """
+        Memory high-water mark against the plan's ceiling.
+
+        The single most useful number about a Render service, and the one the
+        dashboard makes hardest to get: how close it came to the limit that
+        would OOM-kill it.
+
+        Args:
+            service_id: The Render service ID.
+            **kwargs: Passed through to ``metrics`` (``start_time`` etc.).
+
+        Returns:
+            ``{"peak_bytes", "limit_bytes", "pct_of_limit", "samples"}``.
+            ``pct_of_limit`` is None when no limit series came back.
+        """
+        used = self.metrics("memory", service_id, **kwargs)
+        ceiling = self.metrics("memory-limit", service_id, **kwargs)
+
+        values = [
+            point.get("value")
+            for series in used
+            for point in series.get("values") or []
+            if point.get("value") is not None
+        ]
+        limits = [
+            point.get("value")
+            for series in ceiling
+            for point in series.get("values") or []
+            if point.get("value")
+        ]
+        peak = max(values) if values else None
+        limit = max(limits) if limits else None
+        return {
+            "peak_bytes": peak,
+            "limit_bytes": limit,
+            "pct_of_limit": (100.0 * peak / limit) if peak and limit else None,
+            "samples": len(values),
+        }
+
+    # -- service lifecycle ---------------------------------------------
+
+    @retry_render_operation
+    def restart_service(self, service_id: str) -> bool:
+        """
+        Restart a service's instances without rebuilding.
+
+        The right tool when the code is fine and the process is not — a wedged
+        thread pool, a leaked connection, a stuck consumer. It does not redeploy,
+        so it cannot pick up a new commit; use ``trigger_deploy`` for that.
+
+        Args:
+            service_id: The Render service ID.
+
+        Returns:
+            True once Render has accepted the restart. There is a gap between
+            acceptance and the new instance being ready — watch
+            ``list_instances`` or the ``server_available`` event.
+        """
+        self._request("POST", f"/services/{service_id}/restart")
+        logger.info(f"Restarted {service_id}")
+        return True
+
+    @retry_render_operation
+    def suspend_service(self, service_id: str) -> bool:
+        """
+        Suspend a service — stop it running, without deleting it.
+
+        Reversible via ``resume_service``, and the reason this connector exposes
+        no delete: suspending keeps the service, its id, its env vars, its
+        domains and its history, so a wrong suspend costs downtime rather than
+        the object. A suspended web service stops answering — for anything that
+        receives inbound data, that is data not arriving, not merely a tool
+        being offline.
+
+        Args:
+            service_id: The Render service ID.
+
+        Returns:
+            True once Render has accepted the suspension.
+        """
+        self._request("POST", f"/services/{service_id}/suspend")
+        logger.info(f"Suspended {service_id}")
+        return True
+
+    @retry_render_operation
+    def resume_service(self, service_id: str) -> bool:
+        """
+        Resume a suspended service.
+
+        Args:
+            service_id: The Render service ID.
+
+        Returns:
+            True once Render has accepted the resume.
+        """
+        self._request("POST", f"/services/{service_id}/resume")
+        logger.info(f"Resumed {service_id}")
+        return True
+
+    @retry_render_operation
+    def scale_service(self, service_id: str, num_instances: int) -> bool:
+        """
+        Set the number of running instances.
+
+        ⚠ Billing is per instance: three instances of a $25/month plan is
+        $75/month. This is a spend decision, not a tuning knob.
+
+        Horizontal scaling also assumes the service tolerates running more than
+        once — a webhook receiver that dedupes in process memory, or any job
+        holding a singleton lock, does not.
+
+        Args:
+            service_id: The Render service ID.
+            num_instances: How many instances to run.
+
+        Returns:
+            True once Render has accepted the change.
+
+        Raises:
+            ValueError: If num_instances is below 1.
+        """
+        if num_instances < 1:
+            raise ValueError(
+                "num_instances must be at least 1; use suspend_service to stop "
+                "a service, which is reversible and keeps its configuration."
+            )
+        self._request(
+            "POST",
+            f"/services/{service_id}/scale",
+            json_body={"numInstances": num_instances},
+        )
+        logger.info(f"Scaled {service_id} to {num_instances} instance(s)")
+        return True
+
+    @retry_render_operation
+    def update_service(self, service_id: str, **fields: Any) -> Dict[str, Any]:
+        """
+        Patch a service's configuration.
+
+        This is where a **plan change** lives — ``serviceDetails`` carries
+        ``plan``, and moving between plans changes both the monthly cost and the
+        memory ceiling a process is killed at. It is also where the build and
+        start commands, health check path and IP allow list live.
+
+        ⚠ Blueprint-managed services: anything ``render.yaml`` declares is
+        re-applied on the next sync, exactly as with env vars. The env-var guard
+        here cannot see these fields, so for a Blueprint service, edit the file.
+
+        Args:
+            service_id: The Render service ID.
+            **fields: Fields to patch, in Render's own camelCase, e.g.
+                ``serviceDetails={"plan": "pro"}`` or ``branch="main"``.
+
+        Returns:
+            The updated service object.
+
+        Raises:
+            WriteError: If Render rejects the patch.
+        """
+        if not fields:
+            raise WriteError("update_service called with nothing to change")
+        try:
+            result = self._request(
+                "PATCH", f"/services/{service_id}", json_body=fields
+            )
+        except ConnectionError as e:
+            raise WriteError(f"Render rejected the update to {service_id}: {e}") from e
+        if not result:
+            raise WriteError(f"Render refused to update {service_id}")
+        logger.info(f"Updated {service_id}: {sorted(fields)}")
+        return result
+
+    @retry_render_operation
+    def cancel_deploy(self, service_id: str, deploy_id: str) -> bool:
+        """
+        Cancel a deploy that is still building or updating.
+
+        Args:
+            service_id: The Render service ID.
+            deploy_id: The deploy to cancel.
+
+        Returns:
+            True once Render has accepted the cancellation.
+        """
+        self._request(
+            "POST", f"/services/{service_id}/deploys/{deploy_id}/cancel"
+        )
+        logger.info(f"Cancelled deploy {deploy_id} on {service_id}")
+        return True
+
+    @retry_render_operation
+    def rollback_deploy(self, service_id: str, deploy_id: str) -> Dict[str, Any]:
+        """
+        Roll a service back to an earlier deploy.
+
+        Render creates a NEW deploy that restores the old image rather than
+        rewinding history, so the deploy list grows and the rollback is itself
+        rollback-able.
+
+        ⚠ Rolling back moves the code, not the configuration. Env vars, plan and
+        domains stay as they are now, so a rollback does not undo a bad env-var
+        write — and on a Blueprint-managed service the next push re-syncs
+        ``render.yaml`` and can carry the rolled-back change straight back in.
+
+        Note the route is ``POST /services/{id}/rollback`` with the deploy in
+        the body; there is no ``/deploys/{id}/rollback`` (verified 2026-09-15 —
+        that path 404s).
+
+        Args:
+            service_id: The Render service ID.
+            deploy_id: The deploy to roll back TO, from ``list_deploys``.
+
+        Returns:
+            The new deploy object created by the rollback.
+
+        Raises:
+            WriteError: If Render rejects the rollback.
+        """
+        try:
+            result = self._request(
+                "POST",
+                f"/services/{service_id}/rollback",
+                json_body={"deployId": deploy_id},
+            )
+        except ConnectionError as e:
+            raise WriteError(
+                f"Render rejected rolling {service_id} back to {deploy_id}: {e}"
+            ) from e
+        if not result:
+            raise WriteError(
+                f"Render refused to roll {service_id} back to {deploy_id}. A "
+                f"deploy that never went live, or whose image has been pruned, "
+                f"cannot be rolled back to."
+            )
+        logger.info(f"Rolled {service_id} back to {deploy_id}")
+        return result
+
+    # -- service creation ----------------------------------------------
+
+    @retry_render_operation
+    def create_service(
+        self,
+        name: str,
+        service_type: str,
+        repo: str,
+        owner_id: Optional[str] = None,
+        branch: str = "master",
+        runtime: str = "python",
+        plan: str = "starter",
+        region: str = "oregon",
+        build_command: str = "",
+        start_command: str = "",
+        root_dir: str = "",
+        env_vars: Optional[Dict[str, str]] = None,
+        auto_deploy: bool = True,
+        health_check_path: str = "",
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        """
+        Create a new Render service.
+
+        ⚠ **This starts a recurring monthly charge.** Render bills per service
+        per plan, there is no billing endpoint to check the effect against, and
+        nothing on the platform reminds anyone that a service exists. Treat
+        creation as a spend decision with a named owner.
+
+        Prefer a Blueprint where the project has one: a service declared in
+        ``render.yaml`` is reviewable in git and reproducible, whereas one
+        created through the API exists only on the platform. Creating an API
+        service for a project that already has a Blueprint produces a second,
+        un-declared service alongside the declared one — which is a bill nobody
+        is looking at.
+
+        Args:
+            name: Service name. Also the default ``onrender.com`` hostname.
+            service_type: "web_service", "background_worker", "private_service",
+                "static_site" or "cron_job".
+            repo: GitHub clone URL.
+            owner_id: Workspace to create in. Defaults to this key's workspace.
+            branch: Branch to deploy. Default "master".
+            runtime: "python", "node", "docker", "ruby", "go", "rust", "elixir",
+                "image".
+            plan: Instance plan — the monthly cost. Default "starter".
+            region: Render region. Default "oregon", where everything else of
+                ours already runs; a service in another region pays cross-region
+                latency to reach the same database.
+            build_command: e.g. "pip install -r requirements.txt".
+            start_command: e.g. "gunicorn app:app --bind 0.0.0.0:$PORT".
+            root_dir: Subdirectory to build from, for a monorepo.
+            env_vars: ``{key: value}`` set at creation.
+            auto_deploy: Deploy on every push to the branch. Default True.
+            health_check_path: Path Render probes, e.g. "/health". Strongly
+                worth setting on a web service — without one, Render calls a
+                process "up" if it merely accepted the port.
+            **extra: Further ``serviceDetails`` fields.
+
+        Returns:
+            The created service object, with its first deploy already started.
+
+        Raises:
+            WriteError: If Render rejects the creation.
+        """
+        specific: Dict[str, Any] = {}
+        if build_command:
+            specific["buildCommand"] = build_command
+        if start_command:
+            specific["startCommand"] = start_command
+
+        details: Dict[str, Any] = {
+            "runtime": runtime,
+            "plan": plan,
+            "region": region,
+            "envSpecificDetails": specific,
+        }
+        if health_check_path:
+            details["healthCheckPath"] = health_check_path
+        details.update(extra)
+
+        body: Dict[str, Any] = {
+            "type": service_type,
+            "name": name,
+            "ownerId": owner_id or self.owner_id(),
+            "repo": repo,
+            "branch": branch,
+            "autoDeploy": "yes" if auto_deploy else "no",
+            "serviceDetails": details,
+        }
+        if root_dir:
+            body["rootDir"] = root_dir
+        if env_vars:
+            body["envVars"] = [
+                {"key": k, "value": v} for k, v in env_vars.items()
+            ]
+
+        try:
+            result = self._request("POST", "/services", json_body=body)
+        except ConnectionError as e:
+            raise WriteError(f"Render rejected creating {name!r}: {e}") from e
+        if not result:
+            raise WriteError(f"Render refused to create {name!r}")
+
+        service = result.get("service", result)
+        logger.info(
+            f"Created Render service {name!r} ({service.get('id')}), plan {plan}"
+        )
+        return service
+
+    # -- other resources -----------------------------------------------
+
+    @retry_render_operation
+    def list_postgres(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        List managed Postgres databases in the workspace.
+
+        Part of the cost picture and easy to forget: a database bills like a
+        service and outlives the thing that needed it. Also worth watching
+        ``expiresAt`` — a free-tier database is deleted on that date, not
+        downgraded.
+
+        Args:
+            limit: Maximum databases to return.
+
+        Returns:
+            A list of database objects.
+        """
+        return list(self._paginate("/postgres", _ITEM_KEYS["postgres"], limit=limit))
+
+    @retry_render_operation
+    def list_blueprints(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        List Blueprints (``render.yaml``-managed groups) in the workspace.
+
+        Worth reading before any env-var or plan write: a Blueprint whose
+        ``autoSync`` is true re-applies the file on every push to its branch,
+        which is what silently reverts an API write. ``status`` reports whether
+        the platform currently matches the file.
+
+        Args:
+            limit: Maximum Blueprints to return.
+
+        Returns:
+            A list of Blueprint objects with ``name``, ``repo``, ``branch``,
+            ``path``, ``autoSync``, ``status`` and ``lastSync``.
+        """
+        return list(
+            self._paginate("/blueprints", _ITEM_KEYS["blueprints"], limit=limit)
+        )
 
     # -- blueprint awareness -------------------------------------------
 
