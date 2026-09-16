@@ -854,6 +854,60 @@ class TestMessages:
         assert body["body"] == "<p>World</p>"
         assert body["targets"] == [{"type": "tag", "id": "tag-1"}]
 
+    @patch("ccef_connections.connectors.action_network.requests.request")
+    def test_create_message_with_from_reply_to_and_wrapper(self, mock_req, connected):
+        mock_req.return_value = _make_response(200, {"subject": "Hello"})
+        connected.create_message(
+            subject="Hello",
+            body="<p>World</p>",
+            from_email="Org <org@example.org>",
+            reply_to="reply@example.org",
+            wrapper_id="wrap-1",
+        )
+        body = mock_req.call_args.kwargs["json"]
+        assert body["from"] == "Org <org@example.org>"
+        assert body["reply_to"] == "reply@example.org"
+        assert body["_links"]["osdi:wrapper"]["href"] == (
+            f"{ACTION_NETWORK_API_BASE}/wrappers/wrap-1"
+        )
+
+    @patch("ccef_connections.connectors.action_network.requests.request")
+    def test_create_message_without_wrapper_omits_links(self, mock_req, connected):
+        mock_req.return_value = _make_response(200, {})
+        connected.create_message(subject="Hello")
+        body = mock_req.call_args.kwargs["json"]
+        assert "_links" not in body
+
+    @patch("ccef_connections.connectors.action_network.requests.request")
+    def test_update_message(self, mock_req, connected):
+        mock_req.return_value = _make_response(200, {"subject": "Updated"})
+        result = connected.update_message("msg-1", {"subject": "Updated"})
+        assert result["subject"] == "Updated"
+        assert mock_req.call_args.args[0] == "PUT"
+        assert mock_req.call_args.args[1].endswith("/messages/msg-1")
+
+    @patch("ccef_connections.connectors.action_network.requests.request")
+    def test_send_message(self, mock_req, connected):
+        mock_req.return_value = _make_response(200, {"message": "Your message has been sent"})
+        result = connected.send_message("msg-1")
+        assert result == {"message": "Your message has been sent"}
+        assert mock_req.call_args.args[0] == "POST"
+        assert mock_req.call_args.args[1].endswith("/messages/msg-1/send")
+        assert mock_req.call_args.kwargs["json"] is None
+
+    @patch("ccef_connections.connectors.action_network.requests.request")
+    def test_schedule_message(self, mock_req, connected):
+        mock_req.return_value = _make_response(
+            200, {"message": "Your message has been scheduled"}
+        )
+        result = connected.schedule_message("msg-1", "2026-10-01T12:00:00Z")
+        assert result == {"message": "Your message has been scheduled"}
+        assert mock_req.call_args.args[0] == "POST"
+        assert mock_req.call_args.args[1].endswith("/messages/msg-1/schedule")
+        assert mock_req.call_args.kwargs["json"] == {
+            "scheduled_start_date": "2026-10-01T12:00:00Z"
+        }
+
 
 # ==========================================================================
 # Wrappers

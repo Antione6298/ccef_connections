@@ -1291,7 +1291,9 @@ Writes (require the read-write scope):
 **Other resources:**
 
 - `list_lists()` / `get_list(id)` - Lists (queries/segments, read-only)
-- `list_messages()` / `get_message(id)` / `create_message(subject, body=None, targets=None)` - Email messages
+- `list_messages()` / `get_message(id)` - Email messages
+- `create_message(subject, body=None, targets=None, from_email=None, reply_to=None, wrapper_id=None, **kwargs)` / `update_message(id, fields)` - Create/update a message. **Creating always produces a draft** — it shows up as an email in the AN UI but is never sent. `targets` is `[{"href": "<query-url>"}, ...]`; omitted, AN defaults to the full list. `from_email`/`reply_to` are required by AN before a message can be sent or scheduled (the AN field name for sender is the reserved word `from`, hence `from_email`). `wrapper_id` links a wrapper via `_links.osdi:wrapper`; omitted, the organizer's default wrapper applies. AN rate-limits target/wrapper changes to one POST/PUT every 30 seconds.
+- `send_message(id)` / `schedule_message(id, scheduled_start_date)` - The actual send/schedule helpers (`POST /messages/{id}/send` / `/schedule`, the latter taking an ISO-8601 UTC `scheduled_start_date`). **This is the step `create_message` does not do.** Both require the message to be in `draft` status with `total_targeted > 0` — call these only after AN has finished calculating targets (immediately after create/update, the message is briefly in a `calculating` state).
 - `list_wrappers()` / `get_wrapper(id)` / `create_wrapper(...)` / `update_wrapper(id, fields)` - Email wrapper templates
 - `list_custom_fields()` / `get_custom_field(id)` / `create_custom_field(name, format)` / `update_custom_field(id, fields)` - Custom field definitions (metadata)
 - `list_event_campaigns()` / `get_event_campaign(id)` / `create_event_campaign(title, ...)` / `update_event_campaign(id, fields)` - Event campaigns

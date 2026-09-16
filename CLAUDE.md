@@ -119,6 +119,21 @@ Do not add token/basic auth: Zendesk is removing API tokens (creation blocked
 2026-10-27, all tokens dead 2027-04-30). The rate budget is per-account and shared, so
 the connector self-throttles (default 120 req/min, well under the ~400/min ceiling).
 
+## Action Network connector — creating a message never sends it
+
+`create_message()` (and `update_message()`) only ever produce a **draft** — AN
+shows it as an email in the UI, but nothing goes out. Actually delivering it
+is a separate call: `send_message(id)` / `schedule_message(id, scheduled_start_date)`,
+which hit AN's `send`/`schedule` helper endpoints (verified against AN's live
+API docs, 2026-09-16 — the Messages resource page does not itself do this,
+which is why this was missing for one version). Both require the message to
+already be `draft` status with `total_targeted > 0`; call them only after
+targeting has finished computing (right after create/update it's briefly
+`calculating`), or the call fails. `from_email`/`reply_to` on `create_message`
+are required by AN before either helper will accept the message — the AN
+field name for sender is the reserved word `from`, hence the `_email` suffix
+here instead of a bare kwarg.
+
 ## PII / Data Handling
 
 Row-level PII (names, emails, phones, street addresses, gift amounts) **never gets

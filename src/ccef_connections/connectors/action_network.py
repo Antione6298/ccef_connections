@@ -3,8 +3,8 @@ Action Network connector for CCEF connections library.
 
 This module provides full read/write access to the Action Network API v2,
 covering People, Tags, Taggings, Events, Attendances, Petitions, Signatures,
-Forms, Submissions, Fundraising Pages, Donations, Lists, Messages, Wrappers,
-Custom Fields, and Event Campaigns.
+Forms, Submissions, Fundraising Pages, Donations, Lists, Messages (including
+the send/schedule helpers), Wrappers, Custom Fields, and Event Campaigns.
 
 Uses a static API key in the OSDI-API-Token header.  Resources follow the
 OSDI/HAL+JSON format with pagination via ``_links.next.href``.
@@ -888,27 +888,124 @@ class ActionNetworkConnector(BaseConnection):
         subject: str,
         body: Optional[str] = None,
         targets: Optional[List[Dict[str, Any]]] = None,
+        from_email: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        wrapper_id: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
-        Create a message.
+        Create a message. POSTing here always creates a **draft** — it shows
+        up as an email in the Action Network UI but is never sent. Sending
+        or scheduling delivery requires :meth:`send_message` /
+        :meth:`schedule_message` as a separate call against the id this
+        returns.
+
+        AN requires ``subject``, ``body``, ``from``, and ``reply_to`` to send
+        or schedule a message (creation itself only requires ``subject``).
+        Without ``targets``, AN defaults to targeting the full list.
+        Target/wrapper changes are rate-limited by AN to one POST/PUT every
+        30 seconds.
 
         Args:
             subject: Message subject line
             body: Message HTML body
-            targets: List of target criteria dicts
-            **kwargs: Additional message fields
+            targets: List of target dicts, each ``{"href": "<query-url>"}``
+            from_email: Sender address (AN field name is the reserved word
+                ``from``, so it can't be a plain kwarg)
+            reply_to: Reply-to address
+            wrapper_id: Email wrapper UUID to apply (builds the
+                ``_links.osdi:wrapper`` href). Falls back to the
+                organizer's default wrapper if omitted.
+            **kwargs: Additional message fields (e.g. ``name``, ``tag_list``)
 
         Returns:
-            Created message resource
+            Created message resource (draft; not yet sent)
         """
         payload: Dict[str, Any] = {"subject": subject}
         if body:
             payload["body"] = body
         if targets:
             payload["targets"] = targets
+        if from_email:
+            payload["from"] = from_email
+        if reply_to:
+            payload["reply_to"] = reply_to
         payload.update(kwargs)
+        if wrapper_id:
+            links = payload.setdefault("_links", {})
+            links["osdi:wrapper"] = {
+                "href": f"{ACTION_NETWORK_API_BASE}/wrappers/{wrapper_id}"
+            }
         result = self._request("POST", "/messages", json_body=payload)
+        return result or {}
+
+    @retry_action_network_operation
+    def update_message(
+        self, message_id: str, fields: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Update a draft message (PUT). Only ``draft``-status messages can be
+        updated; changes to ``targets`` are rate-limited by AN to one
+        PUT every 30 seconds, same as create.
+
+        Args:
+            message_id: Message UUID
+            fields: Fields to update
+
+        Returns:
+            Updated message resource
+        """
+        result = self._request(
+            "PUT", f"/messages/{message_id}", json_body=fields
+        )
+        return result or {}
+
+    @retry_action_network_operation
+    def send_message(self, message_id: str) -> Dict[str, Any]:
+        """
+        Trigger immediate delivery of a message via AN's send helper.
+
+        Creating a message with :meth:`create_message` only ever produces a
+        draft — this is the separate call AN requires to actually send it.
+        AN requires the message to be in ``draft`` status with
+        ``total_targeted`` greater than 0 (i.e. targeting has finished
+        calculating and resolved to a non-empty audience); calling this too
+        soon after create/update — while AN is still calculating targets —
+        will fail.
+
+        Args:
+            message_id: Message UUID
+
+        Returns:
+            AN's send-helper response
+        """
+        result = self._request("POST", f"/messages/{message_id}/send")
+        return result or {}
+
+    @retry_action_network_operation
+    def schedule_message(
+        self, message_id: str, scheduled_start_date: str
+    ) -> Dict[str, Any]:
+        """
+        Schedule a message for future delivery via AN's schedule helper.
+
+        Same preconditions as :meth:`send_message` (``draft`` status,
+        ``total_targeted`` > 0), plus ``scheduled_start_date`` must be in
+        the future.
+
+        Args:
+            message_id: Message UUID
+            scheduled_start_date: ISO-8601 UTC timestamp, e.g.
+                ``"2026-10-01T12:00:00Z"``
+
+        Returns:
+            AN's schedule-helper response
+        """
+        result = self._request(
+            "POST",
+            f"/messages/{message_id}/schedule",
+            json_body={"scheduled_start_date": scheduled_start_date},
+        )
         return result or {}
 
     # -- Wrappers -------------------------------------------------------------
