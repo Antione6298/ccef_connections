@@ -22,12 +22,19 @@ from ccef_connections.exceptions import (
 FAKE_API_KEY = "fake-an-api-key-12345"
 
 
-def _make_response(status_code=200, json_data=None, text="", headers=None):
-    """Create a mock requests.Response."""
+def _make_response(
+    status_code=200, json_data=None, text="", headers=None, content=b"{}"
+):
+    """Create a mock requests.Response.
+
+    `content` defaults to a non-empty body; pass ``content=b""`` to model the
+    empty 200 that AN's /send and /schedule helpers actually return.
+    """
     resp = MagicMock(spec=requests.Response)
     resp.status_code = status_code
     resp.text = text
     resp.headers = headers or {}
+    resp.content = content
     resp.json.return_value = json_data or {}
     return resp
 
@@ -169,6 +176,31 @@ class TestRequest:
         assert result == {"id": "abc"}
         call_kwargs = mock_req.call_args
         assert call_kwargs.kwargs["json"] == body
+
+    @patch("ccef_connections.connectors.action_network.requests.request")
+    def test_empty_200_returns_none(self, mock_req, connected):
+        """AN's helper endpoints answer success with an empty 200, not a 204.
+        Decoding that body would raise a vendor JSONDecodeError outside the
+        documented contract — and a caller retrying it would double-send."""
+        mock_req.return_value = _make_response(200, content=b"")
+        assert connected._request("POST", "/messages/m1/send") is None
+
+    @patch("ccef_connections.connectors.action_network.requests.request")
+    def test_non_json_200_raises_connection_error(self, mock_req, connected):
+        """A 200 carrying a proxy error page stays inside our exception
+        contract rather than surfacing requests' JSONDecodeError."""
+        resp = _make_response(200, text="<html>gateway</html>")
+        resp.json.side_effect = ValueError("no json")
+        mock_req.return_value = resp
+        with pytest.raises(ConnectionError, match="non-JSON"):
+            connected._request("GET", "/people")
+
+    @patch("ccef_connections.connectors.action_network.requests.request")
+    def test_empty_error_response_still_raises(self, mock_req, connected):
+        """An empty body on a 5xx must not be mistaken for an empty success."""
+        mock_req.return_value = _make_response(500, content=b"", text="")
+        with pytest.raises(ConnectionError, match="500"):
+            connected._request("GET", "/people")
 
     @patch("ccef_connections.connectors.action_network.requests.request")
     def test_401_raises_auth_error(self, mock_req, connected):
@@ -844,15 +876,52 @@ class TestMessages:
     @patch("ccef_connections.connectors.action_network.requests.request")
     def test_create_message(self, mock_req, connected):
         mock_req.return_value = _make_response(200, {"subject": "Hello"})
+        targets = [{"href": f"{ACTION_NETWORK_API_BASE}/queries/query-1"}]
         result = connected.create_message(
             subject="Hello",
             body="<p>World</p>",
-            targets=[{"type": "tag", "id": "tag-1"}],
+            targets=targets,
         )
         body = mock_req.call_args.kwargs["json"]
         assert body["subject"] == "Hello"
         assert body["body"] == "<p>World</p>"
-        assert body["targets"] == [{"type": "tag", "id": "tag-1"}]
+        assert body["targets"] == targets
+
+    @patch("ccef_connections.connectors.action_network.requests.request")
+    def test_create_message_empty_targets_raises(self, mock_req, connected):
+        """An empty target list must never reach AN: omitting `targets`
+        makes AN send to the full list, so [] silently becoming a full-list
+        blast is the failure mode this guards."""
+        with pytest.raises(ValueError, match="send to everyone"):
+            connected.create_message(subject="Hello", targets=[])
+        mock_req.assert_not_called()
+
+    @patch("ccef_connections.connectors.action_network.requests.request")
+    def test_create_message_keeps_empty_strings(self, mock_req, connected):
+        """Empty strings are sent through, not dropped — a subject-only
+        draft from a template that rendered "" is a silent failure."""
+        mock_req.return_value = _make_response(200, {})
+        connected.create_message(
+            subject="Hello", body="", from_email="", reply_to=""
+        )
+        body = mock_req.call_args.kwargs["json"]
+        assert body["body"] == ""
+        assert body["from"] == ""
+        assert body["reply_to"] == ""
+
+    @patch("ccef_connections.connectors.action_network.requests.request")
+    def test_create_message_does_not_mutate_caller_links(self, mock_req, connected):
+        """`_links` arriving via **kwargs belongs to the caller; a reused
+        template must not accumulate wrappers across calls."""
+        mock_req.return_value = _make_response(200, {})
+        shared = {"osdi:other": {"href": "https://example.org/other"}}
+        connected.create_message(
+            subject="Hello", wrapper_id="wrap-1", _links=shared
+        )
+        assert shared == {"osdi:other": {"href": "https://example.org/other"}}
+        sent = mock_req.call_args.kwargs["json"]
+        assert sent["_links"]["osdi:wrapper"]["href"].endswith("/wrappers/wrap-1")
+        assert sent["_links"]["osdi:other"]["href"] == "https://example.org/other"
 
     @patch("ccef_connections.connectors.action_network.requests.request")
     def test_create_message_with_from_reply_to_and_wrapper(self, mock_req, connected):
@@ -907,6 +976,21 @@ class TestMessages:
         assert mock_req.call_args.kwargs["json"] == {
             "scheduled_start_date": "2026-10-01T12:00:00Z"
         }
+
+    @patch("ccef_connections.connectors.action_network.requests.request")
+    def test_send_message_handles_empty_200(self, mock_req, connected):
+        """The real /send response body — a success that carries nothing."""
+        mock_req.return_value = _make_response(200, content=b"")
+        assert connected.send_message("msg-1") == {}
+
+    @pytest.mark.parametrize(
+        "method_name", ["update_message", "send_message", "schedule_message"]
+    )
+    def test_write_methods_are_retry_decorated(self, method_name):
+        """House convention: assert the decorator is attached, so dropping it
+        can't ship silently (a 429 on a send would then fail hard)."""
+        method = getattr(ActionNetworkConnector, method_name)
+        assert hasattr(method, "retry")
 
 
 # ==========================================================================

@@ -163,15 +163,25 @@ class ActionNetworkConnector(BaseConnection):
                 retry_after=retry_after,
             )
 
-        if resp.status_code == 204:
-            return None
-
         if resp.status_code >= 400:
             raise ConnectionError(
                 f"Action Network API error {resp.status_code}: {resp.text}"
             )
 
-        return resp.json()
+        # AN's helper endpoints (/send, /schedule) answer a success with an
+        # empty 200, not a 204. Decoding that body raises a vendor
+        # JSONDecodeError straight past the contract documented above, and a
+        # caller that retries the resulting error double-sends.
+        if resp.status_code == 204 or not resp.content:
+            return None
+
+        try:
+            return resp.json()
+        except ValueError as e:
+            raise ConnectionError(
+                f"Action Network returned a non-JSON {resp.status_code} "
+                f"response: {resp.text[:200]}"
+            ) from e
 
     def _paginate(
         self,
@@ -909,7 +919,9 @@ class ActionNetworkConnector(BaseConnection):
         Args:
             subject: Message subject line
             body: Message HTML body
-            targets: List of target dicts, each ``{"href": "<query-url>"}``
+            targets: List of target dicts, each ``{"href": "<query-url>"}``.
+                Omit for a full-list send; an empty list raises rather than
+                silently becoming one.
             from_email: Sender address (AN field name is the reserved word
                 ``from``, so it can't be a plain kwarg)
             reply_to: Reply-to address
@@ -920,22 +932,41 @@ class ActionNetworkConnector(BaseConnection):
 
         Returns:
             Created message resource (draft; not yet sent)
+
+        Raises:
+            ValueError: If ``targets`` is an empty list
         """
+        # An explicitly-empty target list is always a caller bug, and a
+        # dangerous one: omitting `targets` makes AN target the FULL list, so
+        # silently dropping [] turns "this segment matched nobody" into a
+        # send to everyone. Fail loudly instead of guessing.
+        if targets is not None and len(targets) == 0:
+            raise ValueError(
+                "create_message(targets=[]) is ambiguous: Action Network "
+                "targets the full list when targets is omitted, so an empty "
+                "list would send to everyone. Pass a non-empty target list, "
+                "or omit the argument if a full-list send is intended."
+            )
+
         payload: Dict[str, Any] = {"subject": subject}
-        if body:
+        if body is not None:
             payload["body"] = body
-        if targets:
+        if targets is not None:
             payload["targets"] = targets
-        if from_email:
+        if from_email is not None:
             payload["from"] = from_email
-        if reply_to:
+        if reply_to is not None:
             payload["reply_to"] = reply_to
         payload.update(kwargs)
         if wrapper_id:
-            links = payload.setdefault("_links", {})
+            # Copy before mutating: `_links` may have arrived through
+            # **kwargs, and setdefault() would hand back the caller's own
+            # dict for us to write into.
+            links = dict(payload.get("_links") or {})
             links["osdi:wrapper"] = {
                 "href": f"{ACTION_NETWORK_API_BASE}/wrappers/{wrapper_id}"
             }
+            payload["_links"] = links
         result = self._request("POST", "/messages", json_body=payload)
         return result or {}
 
